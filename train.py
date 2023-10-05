@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torch_efficient_distloss import eff_distloss_native
 from utils import colorize
@@ -42,6 +43,11 @@ def synchronize():
   if world_size == 1:
     return
   dist.barrier()
+
+
+def optimizer_scaler_step_all(model, grad_scaler: GradScaler) -> None:
+  if any(any(p.grad is not None for p in g["params"]) for g in model.optimizer.param_groups):
+    grad_scaler.step(model.optimizer)
 
 
 def train(args):
@@ -112,6 +118,7 @@ def train(args):
   start_epoch = global_step // num_frames
   decay_rate = args.decay_rate
 
+  scaler = torch.cuda.amp.GradScaler()
   # First bootstrap static model for better training stability 
   for epoch in range(start_epoch, args.init_decay_epoch // 2):
     train_dataset.set_epoch(epoch)
@@ -155,17 +162,18 @@ def train(args):
           dim=0,
       )
 
+      static_src_rgbs = (
+          ray_batch['static_src_rgbs'].squeeze(0).permute(0, 3, 1, 2)
+      )
+
+      model.optimizer.zero_grad()
+      # with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
       cb_featmaps_1, _ = model.feature_net(cb_src_rgbs)
       ref_featmaps, anchor_featmaps = (
           cb_featmaps_1[0:num_dy_views],
           cb_featmaps_1[num_dy_views:],
       )
-
-      static_src_rgbs = (
-          ray_batch['static_src_rgbs'].squeeze(0).permute(0, 3, 1, 2)
-      )
       static_featmaps_coarse, _ = model.feature_net_st(static_src_rgbs)
-
       ret = render_rays_mono(
           frame_idx=(ref_frame_idx, anchor_frame_idx),
           time_embedding=(ref_time_embedding, anchor_time_embedding),
@@ -185,7 +193,6 @@ def train(args):
       )
 
       # # compute loss for static region only
-      model.optimizer.zero_grad()
       static_static_mask = 1.0 - ray_batch['static_mask'].float()
       static_static_mask *= ret['outputs_coarse_ref']['mask'].float()
 
@@ -195,8 +202,12 @@ def train(args):
 
       loss = static_loss
 
+      # scaler.scale(loss).backward()
+      # optimizer_scaler_step_all(model, scaler)
+      # scaler.update()
       loss.backward()
       model.optimizer.step()
+
       global_step += 1
 
       if global_step % args.i_img == 0:
@@ -269,15 +280,18 @@ def train(args):
           dim=0,
       )
 
+      static_src_rgbs = (
+          ray_batch['static_src_rgbs'].squeeze(0).permute(0, 3, 1, 2)
+      )
+
+      model.optimizer.zero_grad()
+      # with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
       cb_featmaps_1, _ = model.feature_net(cb_src_rgbs)
       ref_featmaps, anchor_featmaps = (
           cb_featmaps_1[0:num_dy_views],
           cb_featmaps_1[num_dy_views:],
       )
 
-      static_src_rgbs = (
-          ray_batch['static_src_rgbs'].squeeze(0).permute(0, 3, 1, 2)
-      )
       static_featmaps_coarse, _ = model.feature_net_st(static_src_rgbs)
 
       ret = render_rays_mono(
@@ -298,7 +312,6 @@ def train(args):
       )
 
       # # compute loss
-      model.optimizer.zero_grad()
       divisor = epoch // args.init_decay_epoch
 
       rgb_loss = rgb_criterion(ret['outputs_coarse_ref'], ray_batch)
@@ -307,13 +320,13 @@ def train(args):
       )
       # RGB loss for dynamic regions only
       if epoch < (args.init_decay_epoch):
-        dynamic_mask = (
-            ret['outputs_coarse_ref']['mask'].float()
-            * ray_batch['motion_mask'].float()
-        )
-        rgb_loss += compute_rgb_loss(
-            ret['outputs_coarse_ref']['rgb_dy'], ray_batch, dynamic_mask
-        )
+          dynamic_mask = (
+              ret['outputs_coarse_ref']['mask'].float()
+              * ray_batch['motion_mask'].float()
+          )
+          rgb_loss += compute_rgb_loss(
+              ret['outputs_coarse_ref']['rgb_dy'], ray_batch, dynamic_mask
+          )
 
       dynamic_rgb_decay_rate = 10.0
       rgb_loss += rgb_criterion(
@@ -352,9 +365,9 @@ def train(args):
 
       # trajectory consistency loss
       if args.anneal_cycle:
-        w_cycle = min(0.5, args.w_cycle + divisor * args.cycle_factor)
+          w_cycle = min(0.5, args.w_cycle + divisor * args.cycle_factor)
       else:
-        w_cycle = args.w_cycle
+          w_cycle = args.w_cycle
 
       pts_traj_anchor = ret['outputs_coarse_anchor']['pts_traj_anchor']
       pts_traj_ref = ret['outputs_coarse_anchor']['pts_traj_ref']
@@ -435,14 +448,14 @@ def train(args):
 
       # Force static region with > 0.9 prob to have zero dynamic weights
       if divisor > 4:
-        static_sfm_mask_2 = static_static_mask * (weights_ratio < 0.1).float()
-        static_loss += (
-            0.1
-            * torch.sum(
-                torch.abs(render_weights_dy * static_sfm_mask_2.detach())
-            )
-            / torch.sum(static_sfm_mask_2 + 1e-8)
-        )
+          static_sfm_mask_2 = static_static_mask * (weights_ratio < 0.1).float()
+          static_loss += (
+              0.1
+              * torch.sum(
+                  torch.abs(render_weights_dy * static_sfm_mask_2.detach())
+              )
+              / torch.sum(static_sfm_mask_2 + 1e-8)
+          )
 
       loss = (
           rgb_loss
@@ -463,9 +476,14 @@ def train(args):
       scalars_to_log['entropy_loss'] = entropy_loss.item()
       scalars_to_log['static_loss'] = static_loss.item()
 
+      # scaler.scale(loss).backward()
+      # optimizer_scaler_step_all(model, scaler)
+      # scale = scaler.get_scale()
+      # scaler.update()
       loss.backward()
       model.optimizer.step()
 
+      # if scale <= scaler.get_scale():
       if model.scheduler.get_last_lr()[0] > 5e-7:
         model.scheduler.step()
 

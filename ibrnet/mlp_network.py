@@ -4,10 +4,73 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Variable
+from flash_attn import flash_attn_func
+from flash_attn.modules.mha import MHA
+from yet_another_retnet.retention import MultiScaleRetention
 
 
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_set_profiling_mode(False)
+
+
+class RNNModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layer_dim, output_dim):
+        super(RNNModel, self).__init__()
+        
+        # Number of hidden dimensions
+        self.hidden_dim = hidden_dim
+        
+        # Number of hidden layers
+        self.layer_dim = layer_dim
+        
+        # RNN
+        self.rnn = nn.RNN(input_dim, hidden_dim, layer_dim, batch_first=True, nonlinearity='relu')
+        
+        # Readout layer
+        self.fc = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x):
+        
+        # Initialize hidden state with zeros
+        h0 = Variable(torch.zeros(self.layer_dim, x.size(0), self.hidden_dim)).to(x.device)
+            
+        # One time step
+        out, hn = self.rnn(x, h0)
+        # import pdb; pdb.set_trace()
+        out = self.fc(out) 
+        return out
+
+
+class LSTMModel(nn.Module):
+
+    def __init__(self, out_dim, input_dim, hidden_dim, num_layers):
+        super(LSTMModel, self).__init__()
+        
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.input_size = input_dim
+        self.hidden_size = hidden_dim
+        #self.seq_length = seq_length
+        
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=out_dim,
+                            num_layers=num_layers, batch_first=True)
+
+    def forward(self, x):
+        h_0 = Variable(torch.zeros(
+            self.num_layers, x.size(0), self.hidden_size).to(x.device))
+        
+        c_0 = Variable(torch.zeros(
+            self.num_layers, x.size(0), self.hidden_size).to(x.device))
+        
+        # Propagate input through LSTM
+        out, (h_out, _) = self.lstm(x, (h_0, c_0))
+        
+        # h_out = h_out.view(-1, self.hidden_size)
+        
+        # out = self.fc(out)
+       
+        return out
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -21,7 +84,8 @@ class ScaledDotProductAttention(nn.Module):
     attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
 
     if mask is not None:
-      attn = attn.masked_fill(mask == 0, -1e9)
+      _MASKING_VALUE = -1e+9 if attn.dtype == torch.float32 else -1e+4
+      attn = attn.masked_fill(mask == 0, -1e+9)
       # attn = attn * mask
 
     attn = F.softmax(attn, dim=-1)
@@ -102,6 +166,43 @@ class MultiHeadAttention(nn.Module):
     q = self.layer_norm(q)
 
     return q, attn
+
+
+class FlashAttention(nn.Module):
+  def __init__(self, n_head, d_model, d_k, d_v) -> None:
+    super().__init__()
+    self.n_head = n_head
+    self.d_k = d_k
+    self.d_v = d_v
+
+    self.w_qs = nn.Linear(d_model, n_head * d_k, bias=False)
+    self.w_ks = nn.Linear(d_model, n_head * d_k, bias=False)
+    self.w_vs = nn.Linear(d_model, n_head * d_v, bias=False)
+    self.fc = nn.Linear(n_head * d_v, d_model, bias=False)
+    self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+
+  def forward(self, q, k, v):
+    d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
+    sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
+
+    residual = q
+
+    # Pass through the pre-attention projection: b x lq x (n*dv)
+    # Separate different heads: b x lq x n x dv
+    q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
+    k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
+    v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
+
+    # Transpose for attention dot product: b x n x lq x dv
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    q = flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
+    q = q.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
+    q = self.fc(q)
+    q += residual
+
+    q = self.layer_norm(q)
+
+    return q
 
 
 def weights_init(m):
@@ -188,7 +289,13 @@ class DynibarDynamic(nn.Module):
         activation_func,
     )
 
-    self.ray_attention = MultiHeadAttention(4, 128, 32, 32)
+    # self.ray_attention = FlashAttention(4, 128, 32, 32)
+    # self.ray_attention = torch.nn.MultiheadAttention(128, 4, batch_first=True)
+    # self.ray_attention = MHA(128, 4)
+    # self.ray_attention = RNNModel(128, 256, 2, 128)
+    # self.ray_attention = LSTMModel(128, 128, 128, 2)
+    self.ray_attention = MultiScaleRetention(128, 4, relative_position=False, bias=False)
+    # self.ray_attention = MultiHeadAttention(4, 128, 32, 32)
 
     num_c_xyz = (pts_num_freqs * 2 + 1) * 3
 
@@ -284,18 +391,23 @@ class DynibarDynamic(nn.Module):
     num_valid_obs = torch.sum(mask, dim=2)
 
     globalfeat = globalfeat + self.pos_encoding.to(globalfeat.device)
+    # print(f'globalfeat shape {globalfeat.shape}')
+    # globalfeat = self.ray_attention(
+    #     globalfeat
+    # )  # [n_rays, n_samples, 16]
     globalfeat, _ = self.ray_attention(
-        globalfeat, globalfeat, globalfeat, mask=(num_valid_obs > 1).float()
-    )  # [n_rays, n_samples, 16]
-
+      globalfeat, globalfeat, globalfeat,
+    )
+    # print(f'globalfeat after attention/lstm: {globalfeat.shape}')
     pts_xyz_pe = self.pts_embed(pts_xyz)
     globalfeat = self.ref_pts_fc(torch.cat([globalfeat, pts_xyz_pe], dim=-1))
 
     sigma = (
         self.out_geometry_fc(globalfeat) - self.shift
     )  # [n_rays, n_samples, 1]
+    _MASKING_VALUE = -1e+9 if sigma.dtype == torch.float32 else -1e+4
     sigma_out = sigma.masked_fill(
-        num_valid_obs < 1, -1e9
+        num_valid_obs < 1, -1e+9
     )  # set the sigma of invalid point to zero
 
     if self.input_dir:
@@ -379,7 +491,14 @@ class DynibarStatic(nn.Module):
         activation_func,
     )
 
-    self.ray_attention = MultiHeadAttention(4, 128, 32, 32)
+    # self.ray_attention = FlashAttention(4, 128, 32, 32)
+    # self.ray_attention = torch.nn.MultiheadAttention(128, 4, batch_first=True)
+    # self.ray_attention = MHA(128, 4)
+    # self.ray_attention = RNNModel(128, 256, 2, 128)
+    # self.ray_attention = LSTMModel(128, 128, 128, 2)
+    self.ray_attention = MultiScaleRetention(128, 4, relative_position=False, bias=False)
+    # self.ray_attention = MultiHeadAttention(4, 128, 32, 32)
+
     self.out_geometry_fc = nn.Sequential(
         nn.Linear(128, 128), activation_func, nn.Linear(128, 1)
     )
@@ -497,12 +616,18 @@ class DynibarStatic(nn.Module):
     num_valid_obs = torch.sum(mask, dim=2)
 
     # globalfeat = globalfeat #+ self.pos_encoding.to(globalfeat.device)
+    # print(f'globalfeat shape {globalfeat.shape}')
+    # globalfeat = self.ray_attention(
+    #     globalfeat
+    # )  # [n_rays, n_samples, 16]
     globalfeat, _ = self.ray_attention(
-        globalfeat, globalfeat, globalfeat, mask=(num_valid_obs > 1).float()
-    )  # [n_rays, n_samples, 16]
+      globalfeat, globalfeat, globalfeat,
+    )
+    # print(f'globalfeat after attention/lstm: {globalfeat.shape}')
     sigma = self.out_geometry_fc(globalfeat)  # [n_rays, n_samples, 1]
+    _MASKING_VALUE = -1e+9 if sigma.dtype == torch.float32 else -1e+4
     sigma_out = sigma.masked_fill(
-        num_valid_obs < 1, -1e9
+        num_valid_obs < 1, -1e+9
     )  # set the sigma of invalid point to zero
 
     if self.input_dir:
@@ -520,7 +645,8 @@ class DynibarStatic(nn.Module):
 
     x = self.rgb_fc(x)
 
-    x = x.masked_fill(mask == 0, -1e9)
+    _MASKING_VALUE = -1e+9 if x.dtype == torch.float32 else -1e+4
+    x = x.masked_fill(mask == 0, -1e+9)
     blending_weights_valid = F.softmax(x, dim=2)  # color blending
     rgb_out = torch.sum(rgb_in * blending_weights_valid, dim=2)
     out = torch.cat([rgb_out, sigma_out], dim=-1)
