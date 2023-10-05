@@ -1,0 +1,5 @@
+__pycache__
+logs/*
+out/*
+release/*
+dynamic-test/*
